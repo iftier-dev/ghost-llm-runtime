@@ -1,0 +1,182 @@
+name: Build llama-server (CUDA + Metal)
+
+# Honest scope note (read before running): this workflow is written and
+# reviewed carefully, but has NOT been run end-to-end by Claude -- there
+# is no way to execute real GitHub Actions runners or a real CUDA/GPU
+# environment from this session. The CMake flags, CUDA toolkit version,
+# and Ubuntu base image are all verified against current (2026) llama.cpp
+# documentation and community build guides, but the FIRST real run of
+# this workflow is the actual test -- watch its Actions log closely and
+# report back any error rather than assuming success.
+#
+# Manual trigger only (workflow_dispatch) for now -- deliberately NOT
+# on a push/schedule trigger, since compiling CUDA is slow and this
+# should be a conscious, occasional action (e.g. when you want to pick
+# up a new llama.cpp release) rather than running on every commit to
+# this repo.
+on:
+  workflow_dispatch:
+    inputs:
+      llama_cpp_ref:
+        description: "llama.cpp git ref to build (tag, branch, or commit -- e.g. b4000)"
+        required: true
+        default: "master"
+
+permissions:
+  contents: write  # required to create a GitHub Release with the built binaries
+
+jobs:
+  build-linux-cuda:
+    # Ubuntu 22.04 (not the newest 24.04) is used deliberately -- binaries
+    # compiled against an OLDER glibc remain forward-compatible with
+    # machines running NEWER Ubuntu/glibc versions, but not the reverse.
+    # Building on the newest OS would produce a binary that fails with
+    # "GLIBC_2.XX not found" on any volunteer machine running an older
+    # (but still common, e.g. Ubuntu 20.04/22.04) distro.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ github.event.inputs.llama_cpp_ref }}
+          path: llama.cpp
+
+      - name: Install CUDA Toolkit 12.4
+        # 12.4 is the current sweet spot for broad driver compatibility
+        # across consumer NVIDIA GPUs as of 2026 (verified against
+        # multiple current llama.cpp build guides) -- newer Blackwell
+        # (RTX 50-series) cards need 12.8+, which can be added as a
+        # SEPARATE build matrix entry later if volunteer nodes with
+        # that hardware turn out to need it, rather than raising the
+        # floor for everyone now.
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git
+          # Ubuntu 22.04's packaged cmake can be older than llama.cpp
+          # requires -- install a known-current cmake explicitly rather
+          # than trusting the distro package version.
+          pip install --break-system-packages cmake --upgrade || pip3 install cmake --upgrade
+
+      - name: Configure (CMake, CUDA enabled)
+        working-directory: llama.cpp
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build
+        working-directory: llama.cpp
+        run: cmake --build build --config Release -j$(nproc) --target llama-server
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp llama.cpp/build/bin/llama-server dist/llama-server
+          chmod +x dist/llama-server
+          cd dist && tar -czf llama-server-linux-x64-cuda.tar.gz llama-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-linux-x64-cuda
+          path: dist/llama-server-linux-x64-cuda.tar.gz
+
+  build-windows-cuda:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ github.event.inputs.llama_cpp_ref }}
+          path: llama.cpp
+
+      - name: Install CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+      - name: Configure (CMake, CUDA enabled)
+        working-directory: llama.cpp
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build
+        working-directory: llama.cpp
+        run: cmake --build build --config Release --target llama-server
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item llama.cpp\build\bin\Release\llama-server.exe dist\llama-server.exe
+          Compress-Archive -Path dist\llama-server.exe -DestinationPath dist\llama-server-windows-x64-cuda.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-windows-x64-cuda
+          path: dist/llama-server-windows-x64-cuda.zip
+
+  build-macos-metal:
+    # macOS builds use Metal (Apple's native GPU API), not CUDA -- Apple
+    # Silicon has no NVIDIA hardware, so this is the correct backend,
+    # not a fallback/downgrade.
+    runs-on: macos-14  # Apple Silicon (arm64) runner
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ github.event.inputs.llama_cpp_ref }}
+          path: llama.cpp
+
+      - name: Configure (CMake, Metal enabled)
+        working-directory: llama.cpp
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
+
+      - name: Build
+        working-directory: llama.cpp
+        run: cmake --build build --config Release -j$(sysctl -n hw.ncpu) --target llama-server
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp llama.cpp/build/bin/llama-server dist/llama-server
+          chmod +x dist/llama-server
+          cd dist && tar -czf llama-server-macos-arm64-metal.tar.gz llama-server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-macos-arm64-metal
+          path: dist/llama-server-macos-arm64-metal.tar.gz
+
+  publish-release:
+    needs: [build-linux-cuda, build-windows-cuda, build-macos-metal]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llama-${{ github.event.inputs.llama_cpp_ref }}-${{ github.run_number }}
+          name: llama-server ${{ github.event.inputs.llama_cpp_ref }} (build ${{ github.run_number }})
+          files: |
+            artifacts/llama-server-linux-x64-cuda/llama-server-linux-x64-cuda.tar.gz
+            artifacts/llama-server-windows-x64-cuda/llama-server-windows-x64-cuda.zip
+            artifacts/llama-server-macos-arm64-metal/llama-server-macos-arm64-metal.tar.gz
