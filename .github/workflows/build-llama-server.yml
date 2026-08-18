@@ -90,7 +90,7 @@ jobs:
           path: dist/llama-server-linux-x64-cuda.tar.gz
 
   build-windows-cuda:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout llama.cpp
         uses: actions/checkout@v4
