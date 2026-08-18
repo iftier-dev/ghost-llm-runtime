@@ -152,9 +152,16 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
+          # llama-server on macOS links dynamically against several
+          # .dylib files (confirmed by inspecting a previous run's
+          # 49KB "binary", which was actually just the launcher stub
+          # with no libraries bundled) -- copy ALL of them, not just
+          # the executable, or the binary crashes on any machine that
+          # doesn't happen to already have these exact libraries.
           cp llama.cpp/build/bin/llama-server dist/llama-server
+          cp llama.cpp/build/bin/*.dylib dist/ 2>/dev/null || true
           chmod +x dist/llama-server
-          cd dist && tar -czf llama-server-macos-arm64-metal.tar.gz llama-server
+          cd dist && tar -czf llama-server-macos-arm64-metal.tar.gz *
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
